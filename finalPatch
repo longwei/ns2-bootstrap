@@ -1,0 +1,2637 @@
+--- a-ns-allinone-2.34/ns-2.34/Makefile.in	2009-06-14 13:35:44.000000000 -0400
++++ b-ns-allinone-2.34/ns-2.34/Makefile.in	2011-11-04 04:38:21.090033751 -0400
+@@ -82,7 +82,7 @@ LIB	= \
+ 	-lm @LIBS@
+ #	-L@libdir@ \
+ 
+-CFLAGS	+= $(CCOPT) $(DEFINE) 
++CFLAGS	+= -g $(CCOPT) $(DEFINE) 
+ 
+ # Explicitly define compilation rules since SunOS 4's make doesn't like gcc.
+ # Also, gcc does not remove the .o before forking 'as', which can be a
+@@ -246,6 +246,10 @@ OBJ_CC = \
+ 	mac/channel.o mac/mac.o mac/ll.o mac/mac-802_11.o \
+ 	mac/mac-802_11Ext.o \
+ 	mac/mac-802_3.o mac/mac-tdma.o mac/smac.o \
++    mobile/bootstrap/policies.o \
++    mobile/bootstrap/policyqueue.o \
++    mobile/bootstrap/state.o \
++    mobile/bootstrap/timers.o \
+ 	mobile/mip.o mobile/mip-reg.o mobile/gridkeeper.o \
+ 	mobile/propagation.o mobile/tworayground.o \
+ 	mobile/nakagami.o \
+
+--- a-ns-allinone-2.34/ns-2.34/apps/pbc.cc	2009-06-14 13:35:44.000000000 -0400
++++ b-ns-allinone-2.34/ns-2.34/apps/pbc.cc	2011-11-04 02:22:53.930033000 -0400
+@@ -43,7 +43,7 @@
+  * exception.
+  *
+  */
+- 
++
+ /*
+  * For further information see: 
+  * http://dsn.tm.uni-karlsruhe.de/english/Overhaul_NS-2.php
+@@ -54,201 +54,968 @@
+ #include <iostream>
+ #include "random.h"
+ #include "pbc.h"
++#include <math.h>
++#define DEBUG_FSM
++
+ int hdr_pbc::offset_;
+ 
+ /**********************TCL Classes***************************/
+ static class PBCHeaderClass : public PacketHeaderClass {
+ public:
+-	PBCHeaderClass() : PacketHeaderClass("PacketHeader/PBC",
+-					      sizeof(hdr_pbc)) {
+-		bind_offset(&hdr_pbc::offset_);
+-	}
++    PBCHeaderClass() : PacketHeaderClass("PacketHeader/PBC",
++                                         sizeof(hdr_pbc)) {
++        bind_offset(&hdr_pbc::offset_);
++    }
+ } class_pbchdr;
+ 
+ 
+ static class PBCClass : public TclClass {
+ public:
+-	PBCClass() : TclClass("Agent/PBC") {}
+-	TclObject* create(int, const char*const*) {
+-		return (new PBCAgent());
+-	}
++    PBCClass() : TclClass("Agent/PBC") {}
++    TclObject* create(int, const char*const*) {
++        return (new PBCAgent());
++    }
+ } class_pbc;
+ 
+ /**********************PBC Agent****Constructor*************************/
+-PBCAgent::PBCAgent() : Agent(PT_PBC), timer(this)
++PBCAgent::PBCAgent() : Agent(PT_PBC), bcnTimer(this),npFlag_(UNDEFINED),spFlag_(UNDEFINED)
+ {
+-  bind("payloadSize", &size);
+-  bind("periodicBroadcastVariance", &msgVariance);
+-  bind("periodicBroadcastInterval", &msgInterval);
+-  bind("modulationScheme",&modulationScheme);
+-  periodicBroadcast = false;
++    bind("payloadSize", &size_);
++    bind("periodicBroadcastVariance", &msgVariance);
++    bind("periodicBroadcastInterval", &msgInterval);
++    bind("modulationScheme",&modulationScheme);
++    periodicBroadcast = false;
++    
++    /*  code */
++    bind("ni",  &ni_);
++    bind("avgLoss",  &avgLoss_);
++    bind("alpha", &alpha_);
++    bind("halfTimeout",&halfTimeout_);
++    bind("fullTimeout",&fullTimeout_);
++    bind("upkeepTimeout",&upkeepTimeout_);
++    bind("dynaTimerSet", &dynaTimerSet_);// This is the On/Off switch
++
++    myPolicies_ = new PolicyQueue();
++    bcnTimer.start();	/* Starting the Beacon Timer */
+ }
+ 
+ PBCAgent::~PBCAgent()
+ {
+-
++    delete myPolicies_;
+ }
+ 
+ /**********************PBC Agent****Member functions *************************/
+-void PBCAgent::singleBroadcast()
+-{
+-  Packet* pkt = allocpkt();
+-  hdr_cmn *cmnhdr = hdr_cmn::access(pkt);
+-  hdr_pbc* pbchdr = hdr_pbc::access(pkt);
+-  hdr_ip*  iphdr  = hdr_ip::access(pkt);
+-
+-  cmnhdr->next_hop() = IP_BROADCAST;
+-
+-  cmnhdr->size()    = size;
+-  iphdr->src_.addr_ = here_.addr_;  //LL will fill MAC addresses in the MAC header
+-  iphdr->dst_.addr_ = IP_BROADCAST;
+-  iphdr->dst_.port_ = this->port();
+-  pbchdr->send_time	= Scheduler::instance().clock();
++double PBCAgent::connects_ = 0.0;
++std::map<int,double> PBCAgent::globalDelay_;
++std::map<int,double> PBCAgent::globalLoss_;
++
++Packet* PBCAgent::createBroadcast()
++{
++    Packet* pkt = allocpkt();
++    hdr_cmn *cmnhdr = hdr_cmn::access(pkt);
++    hdr_pbc* pbchdr = hdr_pbc::access(pkt);
++    hdr_ip*  iphdr  = hdr_ip::access(pkt);
++    
++    cmnhdr->next_hop() = IP_BROADCAST;
++    
++    //cmnhdr->size()    = size_;
++    cmnhdr->size()    = randomPacketSize();//checked uniform distributed
++    iphdr->src_.addr_ = here_.addr_;  //LL will fill MAC addresses in the MAC header
++    iphdr->dst_.addr_ = IP_BROADCAST;
++    iphdr->dst_.port_ = this->port();
++
++    /* add common header*/
++    pbchdr->sender_id = my_id_;
++    pbchdr->duration  = 0;
++    pbchdr->send_time	= Scheduler::instance().clock();
++
++    //ini
++    pbchdr->isBcn = UNDEFINED;
++    pbchdr->isNbr = UNDEFINED;
++    pbchdr->isNbrA = UNDEFINED;
++    pbchdr->isUpkeep = UNDEFINED;
++    pbchdr->hasNP_for = UNDEFINED;
++    pbchdr->hasSP_for = UNDEFINED;
++    
++    switch (modulationScheme)
++    {
++    case BPSK:   cmnhdr->mod_scheme_ = BPSK;break;
++    case QPSK:   cmnhdr->mod_scheme_ = QPSK;break;
++    case QAM16:  cmnhdr->mod_scheme_ = QAM16;break;
++    case QAM64:  cmnhdr->mod_scheme_ = QAM64;break;
++    default :
++            cmnhdr->mod_scheme_ = BPSK;
++}
++    return pkt;
++}
++
+ 
+-  switch (modulationScheme)
++Packet* PBCAgent::createUnicast(int otherID)
++{
++    
++    Packet* pkt = allocpkt();
++    hdr_cmn *cmnhdr = hdr_cmn::access(pkt);
++    hdr_pbc* pbchdr = hdr_pbc::access(pkt);
++    hdr_ip*  iphdr  = hdr_ip::access(pkt);
++    
++    cmnhdr->addr_type() = NS_AF_ILINK;
++    cmnhdr->next_hop()  = (u_int32_t)(otherID);
++    //    cmnhdr->size()      = size_;
++    cmnhdr->size()      = randomPacketSize();
++    iphdr->src_.addr_ = here_.addr_;  //MAC will fill this address
++    iphdr->dst_.addr_ = (u_int32_t)(otherID);
++    iphdr->dst_.port_ = this->port();
++    
++    /* add common header*/
++    pbchdr->send_time 	= Scheduler::instance().clock();
++    pbchdr->sender_id = my_id_;
++    pbchdr->duration  = 0;
++    pbchdr->seqNum = getNextSeqNum(otherID);
++
++    //ini
++    pbchdr->isBcn = UNDEFINED;
++    pbchdr->isNbr = UNDEFINED;
++    pbchdr->isNbrA = UNDEFINED;
++    pbchdr->isUpkeep = UNDEFINED;
++    pbchdr->hasNP_for = UNDEFINED;
++    pbchdr->hasSP_for = UNDEFINED;
++    
++    switch (modulationScheme)
+     {
+     case BPSK:   cmnhdr->mod_scheme_ = BPSK;break;
+     case QPSK:   cmnhdr->mod_scheme_ = QPSK;break;
+     case QAM16:  cmnhdr->mod_scheme_ = QAM16;break;
+     case QAM64:  cmnhdr->mod_scheme_ = QAM64;break;
+     default :
+-      cmnhdr->mod_scheme_ = BPSK;
++            cmnhdr->mod_scheme_ = BPSK;
++}
++    return pkt;
++}
++
++Packet* PBCAgent::createBcnPacket(){
++    Packet* bcnPkt = createBroadcast();
++    hdr_pbc*  send_pbchdr  = hdr_pbc::access(bcnPkt);
++    send_pbchdr->isBcn = TRUE;
++    double now = Scheduler::instance().clock();
++    if (npFlag_ != UNDEFINED){
++        int otherID = npFlag_;
++        send_pbchdr->hasNP_for = otherID;
++#ifdef DEBUG_FSM
++        printf("%f: node %d attach NP for node %d\n",now ,my_id_,otherID);
++#endif
++        npFlag_ = UNDEFINED;//reset
++    }//attachNeedPolicyReq for incoming node
++    if (spFlag_ != UNDEFINED){
++        int otherID = spFlag_;
++        send_pbchdr->hasSP_for = otherID;//Policy flag for imcoming node
++        send_pbchdr->pq = policies_[otherID];//attachPolicy, casting? check later
++#ifdef DEBUG_FSM
++        printf("%f: node %d attached policy to node %d\n",now ,my_id_,otherID);
++#endif
++        spFlag_ = UNDEFINED;//reset
++    }
++    return bcnPkt;
++}
++
++Packet* PBCAgent::createNbr(Packet* pkt){
++    int otherID = getOtherID(pkt);
++    //changed to unicast
++    Packet* NbrPkt = createUnicast(otherID);
++    hdr_pbc*  send_pbchdr  = hdr_pbc::access(NbrPkt);
++
++    send_pbchdr->isNbr = otherID; //Nbr for some node
++    if (spFlag_ != UNDEFINED){
++        int otherID = spFlag_;
++        send_pbchdr->hasSP_for = otherID;//Policy flag for incoming node
++        send_pbchdr->pq = policies_[otherID];//attachPolicy, casting? check later
++        spFlag_ = UNDEFINED;//reset
++    }
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf("%f: node %d create a Nbr\n",now, my_id_);
++#endif
++
++    return NbrPkt;
++}
++
++Packet* PBCAgent::createNbrA(Packet* pkt){
++    int otherID = getOtherID(pkt);
++    Packet* NbrAPkt = createUnicast(otherID);
++    hdr_pbc*  send_pbchdr  = hdr_pbc::access(NbrAPkt);
++    send_pbchdr->isNbrA = otherID;
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf("%f: node %d create a NbrA\n",now, my_id_);
++#endif
++    return NbrAPkt;
++}
++
++Packet* PBCAgent::createPingPacket(int otherID){
++    Packet* upKeepPkt = createUnicast(otherID);
++    hdr_pbc*  send_pbchdr  = hdr_pbc::access(upKeepPkt);
++    send_pbchdr->isUpkeep = otherID;
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf("%f: node %d create a Ping\n",now, my_id_);
++#endif
++    return upKeepPkt;
++}
++
++void PBCAgent::sendPacket(Packet* pkt){
++    hdr_pbc* send_hdrpbc  = hdr_pbc::access(pkt);
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    if ( send_hdrpbc->isBcn == TRUE ) {
++        printf("%f: node %d send a bcn\n",now, my_id_);
++    } else {// unicast
++        if ( send_hdrpbc->isNbr != UNDEFINED) {
++            printf("%f: node %d send a Nbr to node %d\n",now, my_id_,send_hdrpbc->isNbr);
++        }
++        if ( send_hdrpbc->isNbrA != UNDEFINED) {
++            printf("%f: node %d send a NbrA to node %d\n",now, my_id_, send_hdrpbc->isNbrA);
++        }
++        if ( send_hdrpbc->isUpkeep != UNDEFINED ) {
++            printf("%f: node %d send a Upkeep to node %d\n",now, my_id_, send_hdrpbc->isUpkeep);
++        }        
++    }
++#endif
++    static int loss;
++    static int sum;
++    if (send_hdrpbc->isBcn != TRUE ){
++        sum++;
++        if (doLoss()){// all the packet or unicast packet?
++            printf(", but loss\n");
++            loss++;
++            Packet::free(pkt);
++            return;
++        }
++    }
++    printf("doLoss: %d %d\n",loss, sum);
++    send(pkt,0);// all 4 msg will send by this function, can monitor here for sending info.
++}
++
++inline bool PBCAgent::doLoss()
++{
++    double offset = Random::uniform(0.0, 1.0);
++    return offset < avgLoss_ ? true : false;
++}
++
++inline int PBCAgent::randomPacketSize()
++{
++    RNG* rand  = RNG::defaultrng();
++    return rand->exponential(size_);;
++}
++
++void PBCAgent::dumpStatics()
++{
++    double delay_temp = 0.0;
++    double loss_temp = 0.0;
++    double delay_avg = 0.0;
++    double loss_avg = 0.0;
++
++    std::map <int, double>::const_iterator map_it = globalDelay_.begin();
++    while (map_it != globalDelay_.end()){
++        delay_temp += map_it->second;
++        ++map_it;
+     }
+-  send(pkt,0);
++    if(globalDelay_.size() > 0){
++        delay_avg = delay_temp / (static_cast<double>(globalDelay_.size()));
++    }else {delay_avg = 0;}
++
++    map_it = globalLoss_.begin();
++    while (map_it != globalLoss_.end()){
++        loss_temp += map_it->second;
++        ++map_it;
++    }
++    if(globalLoss_.size() > 0){
++        loss_avg = loss_temp / (static_cast<double>(globalLoss_.size()));
++    } else {loss_avg = 0;}
++    printf("System: %f: %f %f Node# %d\n", Scheduler::instance().clock(),
++           delay_avg, loss_avg, my_id_);
++}
++
++void PBCAgent::calcOptimalValue(int otherID)
++{
++    //delay is the filtered send-recv
++    //loss is the filtered loss
++    double delay = rt_delay_[otherID];
++    double loss = rt_loss_[otherID];
++    static double table_2d[5][13] = {
++        {0.0092,	0.0038,	0.0691,	0.0977,	0.124,	0.175, 0.222,	0.266,	0.309,	0.35,	0.39,	0.429,	0.466},
++        {0.00811,   0.0326,	0.0583,	0.0815,	0.103,	0.143, 0.179,	0.21,	0.246,	0.277,	0.307,	0.36,	0.364},
++        {0.0076,	0.03,	0.0533,	0.074,	0.0932,	0.128, 0.16,	0.191,	0.218,	0.25,	0.27,	0.295,	0.319},
++        {0.00725,   0.0284,	0.05,	0.0692,	0.0868,	0.119, 0.148,	0.175,	0.2,	0.224,	0.247,	0.269,	0.29},
++        {0.007,	0.0272, 0.0476,	0.0656,	0.0821,	0.112, 0.139,	0.164,	0.187,	0.209,	0.23,	0.25,	0.269}
++    };
++    int index_x = findIndexOfX(delay);
++    int index_y = findIndexOfY(loss);
++    t2_[otherID] = table_2d[index_y][index_x];
++    printf("doLoss: %d's t2 %f \n", my_id_,table_2d[index_y][index_x]);
++
++}
++int PBCAgent::findIndexOfX(double x){
++    static double index_x[13] = {0.001,0.005,0.01, 0.015,0.02, 0.03, 0.04,0.05,0.06,0.07,0.08,0.09,0.1};
++    for(int i = 0; i < 13; ++i){
++        if(index_x[i] >= x){
++            return i;
++        }
++    }
++    return 12;
+ }
+ 
++int PBCAgent::findIndexOfY(double y){
++    static double index_y[5] = {0.1,0.3,0.5, 0.7,0.9};
++    for(int i = 0; i < 5; ++i){
++        if(index_y[i] >= y){
++            return i;
++        }
++    }
++    return 4;
++}
+ 
+-void PBCAgent::singleUnicast(int addr)
++void PBCAgent::addPolicy(Policy* p, int type, int id, int id2)
+ {
++    if (id == my_id_) {
++        myPolicies_->enqueue(p, type);
++#ifdef DEBUG_POLICY
++        if ( type == PT_MayShare){
++            printf("Policy setup: node %d enqueue MayShare policy to node %d\n", my_id_, id2);
++        }
++        if ( type == PT_MayBeacon){
++            printf("Policy setup: node %d enqueue MayBeacon policy\n", my_id_);
++        }
++        if ( type == PT_MayAccept){
++            printf("Policy setup: node %d enqueue MayAccept policy to node %d\n", my_id_, id2);
++        }
++        if ( type == PT_MayNeighbor){
++            printf("Policy setup: node %d enqueue MayNeighbor policy to node %d\n", my_id_, id2);
++        }
++#endif
++
++    } else {
++        PolicyQueue* pq = (PolicyQueue*) policies_[id];
++        if (pq == 0) {
++            pq = new PolicyQueue();
++            policies_[id] = pq;
++        }
++        pq->enqueue(p, type);
++#ifdef DEBUG_POLICY
++        if ( type == PT_MayShare){
++            printf("Policy setup: node %d carrying node %d's MayShare policy to %d\n", my_id_, id, id2);
++        }
++        if ( type == PT_MayBeacon){
++            printf("Policy setup: node %d carrying node %d's MayBeacon policy\n", my_id_, id);
++        }
++        if ( type == PT_MayAccept){
++            printf("Policy setup: node %d carrying node %d's MayAccept policy to %d\n", my_id_, id, id2);
++        }
++        if ( type == PT_MayNeighbor){
++            printf("Policy setup: node %d carrying node %d's MayNeighbor policy to %d\n", my_id_, id, id2);
++        }
++#endif
++    }
++}
++
++inline int PBCAgent::getOtherID(Packet* p){
++    hdr_pbc* hdrpbc 	= hdr_pbc::access(p);
++    int otherID 	= hdrpbc->sender_id;
++    return otherID;
++}
++
++void PBCAgent::recvBcn(int otherID){
++    if (firstRecvBcn_[otherID] == 0){
++        double now = Scheduler::instance().clock();
++        firstRecvBcn_[otherID] = now;//only updated after resetFirstSeenBcn
++    }
++}
++void PBCAgent::recvNbr(Packet* pkt){
++    updateSeqNum(pkt);//update seqNum
++}
++void PBCAgent::recvNbrA(Packet* pkt){
++    updateSeqNum(pkt);//update seqNum
++}
++void PBCAgent::recvPing(Packet* pkt){
++    updateSeqNum(pkt);//update seqNum
++}
+ 
+-  Packet* pkt = allocpkt();
+-  hdr_cmn *cmnhdr = hdr_cmn::access(pkt);
+-  hdr_pbc* pbchdr = hdr_pbc::access(pkt);
+-  hdr_ip*  iphdr  = hdr_ip::access(pkt);
++void PBCAgent::updateSeqNum(Packet* pkt){
++    /*
++    *   1. calc rt loss
++    *   2. update globalLoss
++    *   3. remeber this seqNumber
++    */
++    int otherID = getOtherID(pkt);
++    hdr_pbc*  recv_hdrpbc  = hdr_pbc::access(pkt);
++    double now = Scheduler::instance().clock();
++
++    recvSum_[otherID]++;
++    lastRecvSeqNum_[otherID] = recv_hdrpbc->seqNum;// updated done, refresh lastSendSeqNum as the newly received Seq#
++    lastRecvSeqTime_[otherID] = now;
++    printf("doLoss: node %d, recvSum = %d, SeqNumSum = %d\n",my_id_, recvSum_[otherID], recv_hdrpbc->seqNum);
+ 
++}
+ 
+-  cmnhdr->addr_type() = NS_AF_ILINK;
+-  cmnhdr->next_hop()  = (u_int32_t)(addr);
+-  cmnhdr->size()      = size; 
+-  iphdr->src_.addr_ = here_.addr_;  //MAC will fill this address
+-  iphdr->dst_.addr_ = (u_int32_t)(addr);
+-  iphdr->dst_.port_ = this->port();
++int PBCAgent::getNextSeqNum(int otherID){
++    //    printf("currentSeqNum = %d\n", lastSendSeqNum_[otherID]);
++    assert(lastSendSeqNum_[otherID] >= 0);
++    return (++lastSendSeqNum_[otherID]);
++}
++
++void PBCAgent::updateLoss(){
++    double loss_new_temp = 0.00;
++    double loss_old_temp = 0.00;
++    int otherID = -1;
++
++    std::map <int, int>::const_iterator map_it = lastRecvSeqNum_.begin();
++    while (map_it != lastRecvSeqNum_.end()){
++        otherID = map_it->first;
++        loss_old_temp = rt_loss_[otherID];
++        if( (lastRecvSeqNum_[otherID] == lastCalcSeqNum_[otherID])){
++            /*inc rt_loss until 1*/
++            //            if (rt_loss_[otherID] >= 0.9 ){
++            //                rt_loss_[otherID] = 1;
++            //            } else {rt_loss_[otherID] = loss_old_temp + 0.001;}
++        } else {
++            loss_new_temp = 1.00 - ((recvSum_[otherID]) /
++                                    (lastRecvSeqNum_[otherID] - lastCalcSeqNum_[otherID]) );
++            assert(loss_new_temp <= 1);
++            printf("doLoss:: node %d to %d loss new = %f\n",my_id_, otherID, loss_new_temp);
++        }
++        rt_loss_[otherID] = loss_old_temp * (1 - alpha_) + alpha_ * loss_new_temp;
++        //Nov. 1th
++        calcOptimalValue(otherID);
++        //clean-up
++        recvSum_[otherID] = 0;
++        lastCalcSeqNum_[otherID] = lastRecvSeqNum_[otherID];
++        ++map_it;
++    }
+ 
+-  pbchdr->send_time 	= Scheduler::instance().clock();
++    /*global loss calc*/
++    double loss_sum = 0.0;
+ 
+-  switch (modulationScheme)
+-    {
+-    case BPSK:   cmnhdr->mod_scheme_ = BPSK;break;
+-    case QPSK:   cmnhdr->mod_scheme_ = QPSK;break;
+-    case QAM16:  cmnhdr->mod_scheme_ = QAM16;break;
+-    case QAM64:  cmnhdr->mod_scheme_ = QAM64;break;
+-    default :
+-      cmnhdr->mod_scheme_ = BPSK;
++    std::map <int, double>::const_iterator map_iter = rt_loss_.begin();
++    while (map_iter != rt_loss_.end()){
++        loss_sum += map_iter->second;
++        ++map_iter;
+     }
+-  send(pkt,0);
++    if(rt_loss_.size() > 0 && my_id_ >= ni_){
++        globalLoss_[my_id_] = loss_sum / (static_cast<double>(rt_loss_.size()));
++        printf("doLoss:: node %d overall loss = %f\n",my_id_, globalLoss_[my_id_]);}
++
+ }
+ 
+ 
++void PBCAgent::fsmhandler(Packet* pkt){// need a timeout event
++    hdr_pbc*  recv_hdrpbc  = hdr_pbc::access(pkt);
++    int otherID = getOtherID(pkt);
++    //find in my policies queue for this id
++    double now = Scheduler::instance().clock();
++    OkNeighborPolicy* myNeighbourPolicy = myPolicies_->getNeighborPolicy(otherID, now);
++    MaySharePolicy* mySharePolicy = myPolicies_->getMaySharePolicy(otherID, now);
++
++    //    printf("%f: node %d entering FSM\n",now,my_id_);
++    if( (pkt != NULL) && (myNeighbourPolicy == NULL || myNeighbourPolicy->getProposition() == UNDEFINED)){
++        event_t_policyUndef(pkt);//e1
++        return;
++    }
++    if( (recv_hdrpbc->isBcn == TRUE) && (myNeighbourPolicy->getProposition() == TRUE)){
++        event_t_OKNeighbour(pkt);//e2
++        return;   
++    }
++    if( (recv_hdrpbc->isNbr == my_id_) && (myNeighbourPolicy->getProposition() == TRUE)){
++        event_t_nbrRecv(pkt);//e3
++        return;
++    }
++    if( (recv_hdrpbc->hasNP_for == my_id_) && (myNeighbourPolicy->getProposition() == TRUE)
++        && (mySharePolicy->getProposition() == TRUE)){
++        event_t_policyReq(pkt);//e4
++        return;
++    }
++    if( (recv_hdrpbc->isNbrA == my_id_) && (myNeighbourPolicy->getProposition() == TRUE)){
++        event_t_ACK(pkt);//e5
++        return;
++    }
++    if( recv_hdrpbc->isUpkeep == my_id_){
++        event_t_recvUpkeep(pkt);//e2
++        return;
++    }
++
++
++}
++
++//begin 5 events
++void PBCAgent::event_t_policyUndef(Packet* pkt){
++    int otherID = getOtherID(pkt);
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf ("%f :node %d to node %d, policyUndef\n",now, my_id_, otherID);
++#endif
++    switch(links_[otherID]->getState()){
++    case ACTIVE:
++        hasPolicy(pkt);//a0;
++        setNPOnUndef(pkt);//a5
++        setSPOnReq(pkt);//a4
++        enterActive(otherID);//back to Active
++        break;
++    case PASSIVE:
++        break;// keep in Passive
++    case HALF:
++        break;
++    case FULL:
++        break;
++    }
++}
++
++void PBCAgent::event_t_OKNeighbour(Packet* pkt){
++    int otherID = getOtherID(pkt);
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d to node %d, OKNeighbour\n",now ,my_id_, otherID);
++#endif
++    switch(links_[otherID]->getState()){
++    case ACTIVE:
++        setSPOnReq(pkt);//a4
++        enterHalf(pkt);
++        break;
++    case PASSIVE:
++        enterHalf(pkt);
++        break;
++    case HALF:
++        break;
++    case FULL:
++        break;
++    }
++}
++
++void PBCAgent::event_t_nbrRecv(Packet* pkt){
++    int otherID = getOtherID(pkt);
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d to node %d, nbrRecv\n",now, my_id_, otherID);
++#endif
++    switch(links_[otherID]->getState()){
++    case ACTIVE:
++        sendNbrA(pkt);//a3
++        enterFull(pkt);addConnect();
++        break;
++    case PASSIVE:
++        sendNbrA(pkt);//a3
++        enterFull(pkt);addConnect();
++        break;
++    case HALF:
++        sendNbrA(pkt);//a3
++        enterFull(pkt);addConnect();
++        break;
++    case FULL:
++        sendNbrA(pkt);//a3
++        enterFull(pkt);
++        break;
++    }
++}
++
++void PBCAgent::event_t_policyReq(Packet* pkt){
++    int otherID = getOtherID(pkt);
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d to node %d, policyReq\n", now,my_id_, otherID);
++#endif
++    switch(links_[otherID]->getState()){
++    case ACTIVE:
++        break;
++    case PASSIVE:
++        break;
++    case HALF:
++        setSP(otherID);//a2
++        enterHalf(pkt);
++        break;
++    case FULL:
++        break;
++    }
++}
++
++void PBCAgent::event_t_ACK(Packet* pkt){
++    int otherID = getOtherID(pkt);
++    double now = Scheduler::instance().clock();
++#ifdef DEBUG_FSM
++    printf ("%f: node %d to node %d invoke ACK event\n",now, my_id_, otherID);
++#endif
++    switch(links_[otherID]->getState()){
++    case ACTIVE:
++        break;
++    case PASSIVE:
++        break;
++    case HALF:
++        enterFull(pkt);addConnect();
++        break;
++    case FULL:
++        enterFull(pkt);
++        printf ("%f: node %d and node %d connected\n",now, my_id_, otherID);
++        break;
++    }
++}
++
++void PBCAgent::event_t_recvUpkeep(Packet* pkt){
++    int otherID = getOtherID(pkt);
++    if(links_[otherID]->getState() == FULL){
++        links_[otherID]->updateLastRecv();
++    }
++}
++//end 5 events
++
++
++//begin 5 transition action
++void PBCAgent::hasPolicy(Packet* p){//a0
++    hdr_pbc* hdrpbc = hdr_pbc::access(p);
++    MayAcceptPolicy*  acceptPolicy;
++    int otherID = hdrpbc->sender_id;
++    double now = Scheduler::instance().clock();
++    
++    if (hdrpbc->hasSP_for == my_id_ ){//if incoming packet has policy for me
++        acceptPolicy = myPolicies_->getAcceptPolicy(otherID, now);
++        if (acceptPolicy != NULL && acceptPolicy->getProposition() == TRUE){//verify & see whether I can receive policy from this id
++            myPolicies_->accept_pushback(hdrpbc->pq);//accept
++        }
++#ifdef DEBUG_FSM
++        printf ("%f: node %d accpet Policy from %d\n", now, my_id_, otherID);
++#endif
++    }
++
++}
++
++void PBCAgent::setNP(int otherID){//a1
++    npFlag_ = otherID;
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d set NP for %d\n",now, my_id_, otherID);
++}
++
++void PBCAgent::setSP(int otherID){//a2
++    spFlag_ = otherID;
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d set SP for %d\n",now, my_id_, otherID);
++#endif
++}
++
++void PBCAgent::sendNbrA(Packet* pkt){//a3, response a ACK to addr, only send func on the air
++    Packet* NbrApkt = createNbrA(pkt);
++    sendPacket(NbrApkt);
++}
++
++void PBCAgent::setSPOnReq(Packet* pkt){//a4
++    int otherID = getOtherID(pkt);
++    double now = Scheduler::instance().clock();
++    MaySharePolicy* sharePolicy = myPolicies_->getMaySharePolicy(otherID, now);
++    hdr_pbc* hdrpbc = hdr_pbc::access(pkt);
++    if ( (hdrpbc->hasNP_for == my_id_) && sharePolicy->getProposition()==TRUE){
++        spFlag_ = otherID;
++#ifdef DEBUG_FSM
++        printf ("%f: node %d set SP On req of node %d\n", now, my_id_, otherID);
++#endif
++    }
++}
++
++void PBCAgent::setNPOnUndef(Packet* pkt){//a5
++    int otherID = getOtherID(pkt);
++    double now = Scheduler::instance().clock();
++    OkNeighborPolicy* myNeighbourPolicy = myPolicies_->getNeighborPolicy(otherID, now);
++
++    if (myNeighbourPolicy == NULL ||myNeighbourPolicy->getProposition() == UNDEFINED){
++        npFlag_ = otherID;
++#ifdef DEBUG_FSM
++        printf ("%f: node %d set NP if undef to %d\n", now, my_id_, otherID);
++#endif
++    }
++}
++
++//entering 4 states, TODO
++void PBCAgent::enterActive(int otherID){//need to Bcn
++    links_[otherID]->setState(ACTIVE);
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d to node %d, to Active\n", now, my_id_, otherID);
++    Packet* BcnPkt = createBcnPacket();
++    sendPacket(BcnPkt);
++    spFlag_ = UNDEFINED;//clr
++    npFlag_ = UNDEFINED;
++
++    //state changes
++    State* statePtr = links_[otherID];
++    statePtr->fullTimer_->stop();
++    statePtr->halfTimer_->stop();
++    statePtr->upkeepTimer_->stop();
++}
++
++void PBCAgent::enterPassive(int otherID){
++    links_[otherID]->setState(PASSIVE);
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d to node %d, to Passive\n", now, my_id_, otherID);
++#endif
++
++    //state changes
++    State* statePtr = links_[otherID];
++    statePtr->fullTimer_->stop();
++    statePtr->halfTimer_->stop();
++    statePtr->upkeepTimer_->stop();
++}
++
++void PBCAgent::enterHalf(Packet* pkt){//need to Nbr(T->X)
++    int otherID = getOtherID(pkt);
++    links_[otherID]->setState(HALF);
++    double now = Scheduler::instance().clock();
++#ifdef DEBUG_FSM
++    printf ("%f: node %d to node %d, to Half\n", now, my_id_, otherID);
++#endif
++    //send Nbr
++    Packet* NbrPkt = createNbr(pkt);
++    sendPacket(NbrPkt);
++    spFlag_ = UNDEFINED;
++
++    //state changes
++    State* statePtr = links_[otherID];
++    statePtr->fullTimer_->stop();
++    statePtr->upkeepTimer_->stop();
++    if(dynaTimerSet_ == 1 && t2_[otherID] != 0){
++        statePtr->halfTimer_->setTimer(t2_[otherID]);
++        printf ("%f: node %d to node %d, DynaHalf t2 = %f\n", now, my_id_, otherID, t2_[otherID]);
++    }
++    statePtr->halfTimer_->start();//no restarted?
++}
++
++void PBCAgent::enterFull(Packet* pkt){
++    int otherID = getOtherID(pkt);
++    links_[otherID]->setState(FULL);
++#ifdef DEBUG_FSM
++    double now = Scheduler::instance().clock();
++    printf ("%f: node %d to node %d, to Full\n", now, my_id_, otherID);
++#endif
++    //state changes
++    State* statePtr = links_[otherID];
++    statePtr->halfTimer_->stop();
++    statePtr->fullTimer_->stop();
++    statePtr->fullTimer_->start();//restart
++    statePtr->upkeepTimer_->start();
++
++}
++
++void PBCAgent::addConnect(){
++    double now = Scheduler::instance().clock();
++    PBCAgent::connects_ ++;
++}
+ 
+ void PBCAgent::recv(Packet* pkt, Handler*)
+ {
+-	Packet::free(pkt);
++    hdr_pbc* recv_hdrpbc    = hdr_pbc::access(pkt);
++    int otherID   = recv_hdrpbc->sender_id;
++    double now = Scheduler::instance().clock();
++    hdr_pbc* hdrpbc 	= hdr_pbc::access(pkt);
++    if ( otherID == my_id_ || otherID < ni_) { // node# from 0 to < ni_ is noise node.
++        Packet::free(pkt);
++        return;
++    }
++
++    //updated rt_delay
++    double sendTime  	= hdrpbc->send_time;
++    double delay_new    = now - sendTime;
++    double delay_old    = rt_delay_[otherID];
++    rt_delay_[otherID]  = delay_old*(1- alpha_) + alpha_ * delay_new;
++
++    /*update local delay of this agent*/
++    double delay_sum;
++    std::map <int, double>::const_iterator map_it = rt_delay_.begin();
++    while (map_it != rt_delay_.end()){
++        delay_sum += map_it->second;
++        ++map_it;
++    }
++    globalDelay_[my_id_] = delay_sum / (static_cast<double>(rt_delay_.size()));
++
++    printf("%f: Recv, node %d - %d, sendTime = %f, delay_new = %f\n",now, my_id_, otherID, sendTime, now - sendTime);//initial
++    //    dumpStatics();
++    if ( recv_hdrpbc->isBcn == TRUE && otherID != my_id_) {
++#ifdef DEBUG_FSM
++        printf("%f: node %d recv a bcn from node %d\n", now, my_id_, otherID);
++#endif
++        recvBcn(otherID);
++    }
++    if ( recv_hdrpbc->isNbr == my_id_ ) {
++#ifdef DEBUG_FSM
++        printf("%f: node %d recv a Nbr from node %d\n", now, my_id_, otherID);
++#endif
++        recvNbr(pkt);
++    }
++    if ( recv_hdrpbc->isNbrA == my_id_ ) {
++#ifdef DEBUG_FSM
++        printf("%f: node %d recv a NbrA from node %d\n", now, my_id_, otherID);
++#endif
++        recvNbrA(pkt);
++    }
++    if ( recv_hdrpbc->isUpkeep == my_id_) {
++#ifdef DEBUG_FSM
++        printf("%f: node %d recv a UpKeep from node %d\n", now, my_id_, otherID);
++#endif
++        recvPing(pkt);
++    }
++
++    fsmhandler(pkt);
++    Packet::free(pkt);
+ }
+ 
+ /*************************PBC Timer *******************/
+ /****asyn_start() start() stop() setPeriod()***********/
+-void
+-PBCTimer::start(void)
++void PBCTimer::start(void)
+ {
+-  if(!started)
++    if(!started)
+     {
+-      Scheduler &s = Scheduler::instance();
+-      started = 1;
+-      variance = agent->msgVariance;
+-      period = agent->msgInterval;
+-      double offset = Random::uniform(0.0,period);
+-      s.schedule(this, &intr, offset);
++        Scheduler &s = Scheduler::instance();
++        started = 1;
++        variance = agent->msgVariance;
++        period = agent->msgInterval;
++        double offset = Random::uniform(0.0,period);
++        s.schedule(this, &intr, offset);
+     }
+ }
+ 
+ 
+ void PBCTimer::stop(void)
+ {
+-  	Scheduler &s = Scheduler::instance();
+-  	if(started)
+-  	{
+-  		s.cancel(&intr);
+-  	}
+-  	started = 0;
++    Scheduler &s = Scheduler::instance();
++    if(started)
++    {
++        s.cancel(&intr);
++    }
++    started = 0;
+ }
+ 
+ void PBCTimer::setVariance(double v)
+ {
+-  if(v >= 0) variance = v;
++    if(v >= 0) variance = v;
+ }
+ 
+ void PBCTimer::setPeriod(double p)
+ {
+-  if(p >= 0) period = p;
++    if(p >= 0) period = p;
+ }
+-
++/*Beacn Timer*/
+ void PBCTimer::handle(Event *e)
+ {
+-	agent->singleBroadcast();
+-	if(agent->periodicBroadcast)
+-	  {
+-	    Scheduler &s = Scheduler::instance();
+-	    double t = period - variance + Random::uniform(variance*2);
+-	    s.schedule(this, &intr, t>0.0 ? t : 0.0);
+-	  }
++    double now = Scheduler::instance().clock();
++    agent->sendPacket(agent->createBcnPacket());
++    if(agent->myPolicies_->getBeaconPolicy()->getProposition() == TRUE)
++    {
++        Scheduler &s = Scheduler::instance();
++        double bcnIntrvl =agent->myPolicies_->getBeaconPolicy()->getBeaconInterval();
++        double t = bcnIntrvl - variance + Random::uniform(variance*2);
++        s.schedule(this, &intr, t>0.0 ? t : 0.0);
++    }
++    /*LossCalc*/
++    agent->updateLoss();
++    if(agent->getMyID() >= agent->ni_){//means this node is a noise node
++        agent->dumpStatics();
++    }
++    printf("Connect: %f %d\n",now, (int)(PBCAgent::connects_/2.0));
+ }
+ 
+-
+ /*************************************************************************/
+ 
+ 
+ int PBCAgent::command(int argc, const char*const* argv)
+ {
+-	if (argc == 2) 
+-	{
+-		if (strcmp(argv[1], "singleBroadcast") == 0)
+-		{
+-			singleBroadcast();
+-			return (TCL_OK);
+-		}
+-		if (strcmp(argv[1], "stop") == 0)
+-		{
+-		  timer.stop();
+-		  return (TCL_OK);
+-		}
+-	}
+-	if (argc == 3)
+-	{
+-		if(strcmp(argv[1],"unicast")==0)
+-		  {
+-		    int addr =atoi(argv[2]);
+-		    singleUnicast(addr);
+-		    return TCL_OK;
+-		  }
+-		if(strcmp(argv[1],"PeriodicBroadcast") ==0)
+-		{
+-		  if (strcmp(argv[2],"ON") == 0 )
+-		    {
+-		      periodicBroadcast = true;
+-		      timer.start();
+-		      return TCL_OK;
+-		    }
+-		  if(strcmp(argv[2],"OFF") ==0 )
+-		    {
+-		      periodicBroadcast = false;
+-		      timer.stop();
+-		      return TCL_OK;
+-		    }
+-		}
+-
+-
+-	}
+-	// If the command hasn't been processed by PBCAgent()::command,
+-	// call the command() function for the base class
+-	return (Agent::command(argc, argv));
++    if (argc == 2)
++    {
++        if (strcmp(argv[1], "stop") == 0)
++        {
++            bcnTimer.stop();
++            return (TCL_OK);
++        }
++    }
++    if (argc == 3)
++    {
++        if(strcmp(argv[1],"PeriodicBroadcast") ==0)
++        {
++            if (strcmp(argv[2],"ON") == 0 )
++            {
++                periodicBroadcast = true;
++                bcnTimer.start();
++                return TCL_OK;
++            }
++            if(strcmp(argv[2],"OFF") ==0 )
++            {
++                periodicBroadcast = false;
++                bcnTimer.stop();
++                return TCL_OK;
++            }
++        }
++        if (strcmp(argv[1], "SetID") == 0) {
++            my_id_ = atoi(argv[2]);
++            return TCL_OK;
++        }
++        if (strcmp(argv[1], "SetNN") == 0) {
++            nn_ = atoi(argv[2]);
++            return TCL_OK;
++        }
++    }
++    if (argc == 9) {
++        if (strcmp(argv[1], "CreatePolicy") == 0) {
++            //Format:: PBCAgentr CreatePolicy TYPE ID REFRESHINTERVAL STARTTIME ENDTIME ID2 PROPOSITION
++            int type 	 = atoi(argv[2]);
++            // Policy Type 		e.g. MayShare, MayAccept, etc.
++            int id  	 = atoi(argv[3]);
++            // Designated ID	e.g  The policy belongs to this ID node.
++            double ri	 = atof(argv[4]);
++            // Refresh Interval	e.g. Needed but not implemented.
++            double st 	 = atof(argv[5]);
++            // Start Time		e.g. When does the policy start
++            double et	 = atof(argv[6]);
++            // End Time		e.g. When does the policy becomes obsolete
++            int otherID		 = atoi(argv[7]);
++            // Other ID		e.g. The other node where this policy is applied to
++            int prop 	 = atoi(argv[8]);
++            // Proposition		e.g. UNDEFINED, TRUE, FALSE
++            int bcn 	 = atoi(argv[7]);	// Beacon Prop		e.g.
++            double intr	 = atof(argv[8]);	// Beacon Interval	e.g
++            
++            MaySharePolicy *sp;
++            MayAcceptPolicy* ap;
++            OkNeighborPolicy* onp;
++            BeaconPolicy* bp;
++            
++            switch (type) {
++            case PT_MayBeacon:
++                { //need to ini the state, if bcn, then Active,else passive
++                    if ( bcn == TRUE ) {// must have #$agent_($i) set upkeepTimeout, or State is mess
++                        for (int i = 0; i < nn_; i++){
++                            links_[i] = new State(this, i, halfTimeout_,fullTimeout_,upkeepTimeout_);
++                            links_[i]->setState(ACTIVE);
++                        }
++                    } else {
++                        for (int i = 0; i < nn_; i++){
++                            links_[i] = new State(this, i, halfTimeout_,fullTimeout_,upkeepTimeout_);
++                            links_[i]->setState(PASSIVE);
++                        }
++                    }
++                };
++                //int curr_state;
++                //curr_state = links_[id2]->getState();//DELETE ME
++                bp = new BeaconPolicy(id, ri, st, et, bcn, intr);
++                addPolicy(bp, PT_MayBeacon, id, bcn);
++                return TCL_OK;
++            case PT_MayShare:
++                sp = new MaySharePolicy(id, ri, st, et, otherID, prop);
++                addPolicy(sp, PT_MayShare, id, otherID);
++                return TCL_OK;
++            case PT_MayAccept:
++                ap = new MayAcceptPolicy(id, ri, st, et, otherID, prop);
++                addPolicy(ap, PT_MayAccept, id, otherID);
++                return TCL_OK;
++            case PT_MayNeighbor:
++                onp = new OkNeighborPolicy(id, ri, st, et, otherID, prop);
++                addPolicy(onp, PT_MayNeighbor, id, otherID);
++                return TCL_OK;
++            default:
++                break;
++            }
++        }
++    }
++    // If the command hasn't been processed by PBCAgent()::command,
++    // call the command() function for the base class
++    return (Agent::command(argc, argv));
+ }
+
+--- a-ns-allinone-2.34/ns-2.34/apps/pbc.h	2009-06-14 13:35:44.000000000 -0400
++++ b-ns-allinone-2.34/ns-2.34/apps/pbc.h	2011-11-04 02:23:01.198038000 -0400
+@@ -1,56 +1,3 @@
+-/*
+- * Copyright (C) 2007 
+- * Mercedes-Benz Research & Development North America, Inc. and
+- * University of Karlsruhe (TH)
+- * All rights reserved.
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License along
+- * with this program; if not, write to the Free Software Foundation, Inc.,
+- * 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
+- *
+- *
+- * The copyright of this module includes the following
+- * linking-with-specific-other-licenses addition:
+- *
+- * In addition, as a special exception, the copyright holders of
+- * this module give you permission to combine (via static or
+- * dynamic linking) this module with free software programs or
+- * libraries that are released under the GNU LGPL and with code
+- * included in the standard release of ns-2 under the Apache 2.0
+- * license or under otherwise-compatible licenses with advertising
+- * requirements (or modified versions of such code, with unchanged
+- * license).  You may copy and distribute such a system following the
+- * terms of the GNU GPL for this module and the licenses of the
+- * other code concerned, provided that you include the source code of
+- * that other code when and as the GNU GPL requires distribution of
+- * source code.
+- *
+- * Note that people who make modified versions of this module
+- * are not obligated to grant this special exception for their
+- * modified versions; it is their choice whether to do so.  The GNU
+- * General Public License gives permission to release a modified
+- * version without this exception; this exception also makes it
+- * possible to release a modified version which carries forward this
+- * exception.
+- *
+- */
+- 
+-/*
+- * For further information see: 
+- * http://dsn.tm.uni-karlsruhe.de/english/Overhaul_NS-2.php
+- */
+-
+-
+-
+ #ifndef ns_pbc_h
+ #define ns_pbc_h
+ 
+@@ -60,57 +7,194 @@
+ #include "address.h"
+ #include "ip.h"
+ 
+-
++#include <map>
++#include <vector>
++#include <math.h>
++
++#include "bootstrap/policies.h"
++#include "bootstrap/policyqueue.h"
++#include "bootstrap/state.h"
++
++///////////////////////////////////////////////////////////////////////////////////////////
++// Constants
++// 		Use throughout the bootstrap protocol.
++///////////////////////////////////////////////////////////////////////////////////////////
++
++#define UNDEFINED	-1
++
++#define PT_MayShare         2/* PT = Policy Type */
++#define PT_MayBeacon        3
++#define PT_MayAccept        4
++#define PT_MayNeighbor      5
++#define PT_Generic          6
++
++#define PASSIVE        7/* Passive means node is not broadcasting */
++#define ACTIVE         8/* Active means a node has a beacon policy and is broadcasting */
++#define HALF           9/* Attempting to connect to a mobile node */
++#define FULL           10/* Has a direct connection to a mobile node */
++#define NODE            20
++#define DEBUG_POLICY
+ 
+ struct hdr_pbc {
+-	double 	send_time;
+-	static int offset_; // required by PacketHeaderManager
+-	inline static int& offset() { return offset_; }
+-	inline static hdr_pbc* access(const Packet* p) {
+-		return (hdr_pbc*) p->access(offset_);
+-	}
++    double send_time; //sendTime is the time of creating or resending the packet
++    double duration; //duration from the allocating to deallocating the pkt, will accumulated.
++    int sender_id; //the id of the node that sending this packet.
++    int seqNum; // the sequence track number of each blank packet
++    int isBcn; // is this packet a Beacn? Broadcast
++    int isNbr; //is this packet a neighbour setup request for me? Broadcast
++    int hasNP_for; // contain need policy request for node id? can be both in bcn and Nbr, -1: has no NP request
++    int hasSP_for; // contain policy for node id, the policy object is the pq? can be in Bcn, -1: has no sending policy
++    int isNbrA; // is a ACK replay to Nbr for me?
++    int isUpkeep; // is a upkeep msg for me?
++    PolicyQueue* pq;//this is the queue of the policy for node X, upon Np(X->T)
++    static int offset_; // required by PacketHeaderManager
++
++    inline static int& offset() { return offset_; }
++    inline static hdr_pbc* access(const Packet* p) {
++        return (hdr_pbc*) p->access(offset_);
++    }
+ };
+ 
+ class PBCAgent;
+-
++class State;
+ 
+ 
+ class PBCTimer : public Handler {
+ public:
+-	PBCTimer(PBCAgent* ag, double p = 1) : agent(ag), period(p) {
+-		started = 0;
+-		}
+-	void start(void);
+-	void stop(void);
+-	void setPeriod(double p);
+-	void setVariance(double v);
+-	void handle(Event *e);
+-
++    PBCTimer(PBCAgent* ag, double p = 1) : agent(ag), period(p) {
++        started = 0;
++    }
++    void start(void);
++    void stop(void);
++    void setPeriod(double p);
++    void setVariance(double v);
++    void handle(Event *e);
++    
+ protected:
+-	int		started;
+-	Event		intr;		
+-	PBCAgent	*agent;
+-	double		period;
+-	double		variance;
++    int		started;
++    Event	intr;
++    PBCAgent	*agent;
++    double	period; //unused, due to Bcn interval
++    double	variance;
+ };
+ 
+ class PBCAgent : public Agent {
+-	friend class PBCTimer;
++    friend class PBCTimer;
++    friend class State;
+ public:
+-	PBCAgent();
+-	~PBCAgent();
+-	virtual int command(int argc, const char*const* argv);
+-	virtual void recv(Packet*, Handler*);
+-	void	singleBroadcast();
+-	void    singleUnicast(int addr);
+-	bool    periodicBroadcast;
++    PBCAgent();
++    ~PBCAgent();
++    virtual int command(int argc, const char*const* argv);
++    virtual void recv(Packet*, Handler*);
++    //void    singleBroadcast();
++    //void    singleUnicast(int addr);
++    bool    periodicBroadcast;
++
++    /*add*/
++    //=========FSM=========
++    void fsmhandler(Packet* p);
++    //events
++    void event_t_policyUndef(Packet* pkt);// invoke relative state obj
++    void event_t_OKNeighbour(Packet* pkt);// must pass pkt, because hasPolicy, setSPonReq need to analysis the packet
++    void event_t_nbrRecv(Packet* pkt);//when recv a Nbr
++    void event_t_policyReq(Packet* pkt);// when contain a NP and NeighbourOK and Mayshare
++    void event_t_ACK(Packet* pkt);//when recv a NbrA
++    void event_t_recvUpkeep(Packet* pkt);//when recv a upkeep
++    //actions
++    void hasPolicy(Packet* p);//a0
++    void setNP(int otherID);//a1
++    void setSP(int otherID);//a2
++    void sendNbrA(Packet* p);//a3
++    void setSPOnReq(Packet* p);//a4
++    void setNPOnUndef(Packet* pkt);//a5
++    //to State
++    void enterActive(int otherID);
++    void enterPassive(int otherID);
++    void enterHalf(Packet* p);
++    void enterFull(Packet* p);
++    void inline addConnect();
++    //======================
++
++    //======packet create=======
++    Packet* createBroadcast();
++    Packet* createUnicast(int otherID);
++
++    Packet* createBcnPacket();
++    Packet* createNbr(Packet*);
++    Packet* createNbrA(Packet*);
++    Packet* createPingPacket(int addr);
++    void sendPacket(Packet*);
++    //==========================
++
++
++    //=========Optimization=========
++    inline bool doLoss();
++    inline int randomPacketSize();
++    void dumpStatics();
++    /* Newton's Method to calculate optimal t2*/
++    void calcOptimalValue(int otherID);
++    int findIndexOfX(double x);
++    int findIndexOfY(double x);
++    //============================
++
++    //========policy==============
++    void addPolicy(Policy*, int type, int id, int id2);
++    inline int getOtherID(Packet* p);
++    int getMyID(){return my_id_;}
++    //============================
++
++    //===rt Loss and Delay Calc===
++    //    void updateDelay(Packet* pkt);
++    void recvBcn(int otherID);
++    void recvNbr(Packet* pkt);
++    void recvNbrA(Packet* pkt);
++    void recvPing(Packet* pkt);
++    void updateSeqNum(Packet* pkt);
++    int getNextSeqNum(int otherID);
++    void resetFirstSeenBcn(int otherID){firstRecvBcn_[otherID] = 0;}
++    void updateLoss();
++
++    int    dynaTimerSet_;
++    double avgLoss_;
++    double avgDelay_;
++    int ni_;
++
++    double halfTimeout_; 			/* The half Timeout value */
++    double fullTimeout_; 			/* The half Timeout value */
++    double upkeepTimeout_;			/* The upkeep timeout value */
++
++    double msgInterval;
++    double msgVariance;
++    /***Statics***/
++    double alpha_;
++    static double connects_;// updated and dump on add and decre connects
++    static std::map<int,double> globalDelay_;//Node# with overall delay of that node.
++    static std::map<int,double> globalLoss_;
++    std::map<int,int> recvSum_;
++    std::map<int, int> lastRecvSeqNum_;//recvBuff: kept state for loss calc
++    std::map<int, int> lastCalcSeqNum_;//recvBuff: kept state for loss calc
++    std::map<int, double> lastRecvSeqTime_;//RecvBuff: kept last recv time for exception control
+ 
+-	double msgInterval;
+-	double msgVariance;
+ private:
+-	PBCTimer  timer;
+-	int size;
+-	int modulationScheme;
++    PBCTimer  bcnTimer;
++    int size_;
++    int modulationScheme;
++
++    //add
++    int my_id_;
++    int nn_;//number of node.
++    std::map<int, State*> links_;
++    int npFlag_;
++    int spFlag_;
++    PolicyQueue* myPolicies_; // policy queue for this node
++    std::map<int, PolicyQueue*>  policies_; // policy queue for others, I just carry it
++    //====updated loss and delay info
++    std::map<int, double> firstRecvBcn_;//reset when drop Connection.(NbrTimeout)
++    std::map<int, int> lastSendSeqNum_;//sendBuff: sequence number
++    std::map<int, double> rt_loss_;//updateSeqNumber, Nbr, NbrA, Ping
++    std::map<int, double> rt_delay_;//updated per packet recv
++    std::map<int, double> t2_;//optimazed value for half timer
++
+ };
+ 
+ #endif // ns_pbc_h
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policies.cc	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policies.cc	2011-11-04 02:23:24.989034000 -0400
+@@ -0,0 +1,95 @@
++#include "policies.h"
++#include <iostream>
++#include "scheduler.h"
++#include "ping.h"
++#include "pbc.h"
++
++
++
++Policy::Policy() 
++{
++    policySeqNum_       = 0;
++    node_id_            = 0;
++    refreshInterval_    = 0;
++    startTime_ 		= 0;
++    endTime_ 		= 0;
++    prop_		= UNDEFINED;
++}
++void Policy::debug() 
++{
++    printf("\n");
++    printf(" policySeqNum = %d \n node_id = %d \n refreshInterval = %lf \n startTime = %lf \n endTime = %lf ",
++           policySeqNum_, node_id_, refreshInterval_, startTime_, endTime_ );
++}
++
++BeaconPolicy::BeaconPolicy(int id, double ri, double st, double et, int p, double bi)
++{
++    policySeqNum_ 	= (int) Scheduler::instance().clock();
++    node_id_ 		= id;
++    refreshInterval_ 	= ri;
++    startTime_ 		= st;
++    endTime_ 		= et;
++    prop_		= p;
++    bcnInterval_	= bi;
++    next_		= 0;
++
++}
++
++void BeaconPolicy::debug() 
++{
++    printf(" Beacon Policy =  {%d    %d    %lf    %lf    %lf    %d    %lf} \n",
++           policySeqNum_, node_id_, refreshInterval_, startTime_, endTime_, prop_, bcnInterval_);
++}
++
++MaySharePolicy::MaySharePolicy(int id, double ri, double st, double et, int smi, int p)
++{
++    policySeqNum_ 	= (int) Scheduler::instance().clock();
++    node_id_ 		= id;
++    refreshInterval_	= ri;
++    startTime_ 		= st;
++    endTime_ 		= et;
++    shareMobileID_	= smi;
++    prop_		= p;
++    next_		= 0;
++}
++
++void MaySharePolicy :: debug() 
++{
++    printf(" MaySharePolicy = {%d    %d    %lf    %lf    %lf    %d    %d} \n",
++           policySeqNum_, node_id_, refreshInterval_, startTime_, endTime_, shareMobileID_, prop_);
++}
++
++MayAcceptPolicy::MayAcceptPolicy(int id, double ri, double st, double et, int ami, int p) 
++{ 
++    policySeqNum_ 	= (int) Scheduler::instance().clock();
++    node_id_		= id;
++    refreshInterval_	= ri;
++    startTime_		= st;
++    endTime_		= et;
++    acceptMobileID_ 	= ami;
++    prop_		= p;
++    next_		= 0;
++}
++void MayAcceptPolicy :: debug() 
++{	
++    printf(" MayAccept = {%d    %d    %lf    %lf    %lf    %d    %d} \n",
++           policySeqNum_, node_id_, refreshInterval_, startTime_, endTime_, acceptMobileID_, prop_);
++}
++
++OkNeighborPolicy::OkNeighborPolicy(int id, double ri, double st, double et, int nid, int p)
++{
++    policySeqNum_	= (int) Scheduler::instance().clock();
++    node_id_		= id;
++    refreshInterval_	= ri;
++    startTime_		= st;
++    endTime_		= et;
++    neighborID_		= nid;
++    prop_		= p;
++    next_		= 0;
++}  
++
++void OkNeighborPolicy::debug() 
++{
++    printf(" OkNeighbor = {%d    %d    %lf    %lf    %lf    %d    %d} \n",
++           policySeqNum_, node_id_, refreshInterval_, startTime_, endTime_, neighborID_, prop_);
++}
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policies.h	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policies.h	2011-11-04 02:25:10.677034000 -0400
+@@ -0,0 +1,134 @@
++#ifndef policies_h
++#define policies_h 
++
++#include <iostream>
++#include <queue>
++#include <vector>
++
++
++class Policy {
++
++public:
++    Policy();
++
++    void setPolicySeqNum(int seqNum) {
++        policySeqNum_ = seqNum;
++    }
++    int getPolicyId() {
++        return policySeqNum_;
++    }
++    double getRefreshInterval () {
++        return refreshInterval_;
++    }
++    double getStartTime () {
++        return startTime_;
++    }
++    double getEndTime() {
++        return endTime_;
++    }
++    void debug();
++
++protected:
++    int policySeqNum_;	    /* GUID of the policy */
++    int node_id_;	    /* Policy Designated for */
++    double refreshInterval_;/* Not Implemented */
++    double startTime_;	    /* When policy's going to start */
++    double endTime_; 	    /* When policy's going to end */
++    int prop_;		    /* TRUE, FALSE, UNDEFINED */
++};
++
++
++
++class BeaconPolicy : public Policy {
++public:
++    BeaconPolicy* next_;
++
++    BeaconPolicy(int id, double ri, double st, double et, int p, double bi);
++
++    void inline setProposition(int value) {
++        prop_ = value;
++    }
++    int inline getProposition() {
++        return prop_;
++    }
++    double inline getStartTime() {
++        return startTime_;
++    }
++    double inline getEndTime() {
++        return endTime_;
++    }
++    double inline getBeaconInterval() {
++        return bcnInterval_;
++    }
++    void debug();
++
++private:
++    double bcnInterval_;
++
++};
++
++class MaySharePolicy : public Policy {
++public:
++    MaySharePolicy* next_;
++
++    MaySharePolicy(int, double, double, double, int, int);
++
++    void inline setProposition(int value) {
++        prop_ = value;
++    }
++    int inline getProposition() {
++        return prop_;
++    }
++    int inline getOtherID() {
++        return shareMobileID_;
++    }
++    void debug();
++
++private:
++    int shareMobileID_;
++};
++
++class MayAcceptPolicy : public Policy {
++public: 	
++    MayAcceptPolicy* next_;
++
++    MayAcceptPolicy(int, double, double, double, int, int);
++
++    void inline setProposition(int value) {
++        prop_ = value;
++    }
++    int inline getProposition() {
++        return prop_;
++    }
++    int inline getOtherID() {
++        return acceptMobileID_;
++    }
++    void debug();
++
++private:
++    int acceptMobileID_;
++};
++
++class OkNeighborPolicy : public Policy {
++public:
++
++    OkNeighborPolicy* next_;
++
++    OkNeighborPolicy(int, double, double, double, int, int);
++    void setProposition(int value) {
++        prop_ = value;
++    }
++    int getProposition() {
++        return prop_;
++    }
++    int getOtherID() {
++        return neighborID_;
++    }
++    void debug();
++
++private:
++    int neighborID_;
++};
++
++
++#endif 
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policyqueue.cc	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policyqueue.cc	2011-11-04 02:27:46.065035000 -0400
+@@ -0,0 +1,625 @@
++#include "policyqueue.h"
++#include "pbc.h"
++#include <stdio.h>
++
++
++PolicyQueue::PolicyQueue()
++{
++    bcnHead_  = 0;
++    bcnTail_  = 0;
++    bcnSize_  = 0;
++}
++
++PolicyQueue::~PolicyQueue(){
++
++    std::map<int, MaySharePolicy*>::const_iterator map_share = shareHead_.begin();
++    while (map_share != shareHead_.end()) {
++        MaySharePolicy* deletePtr = (*map_share).second;
++        MaySharePolicy* tempPtr = NULL;
++        while ( deletePtr != NULL){
++            tempPtr = deletePtr->next_;
++            delete deletePtr;
++            deletePtr = tempPtr;
++        }
++        ++map_share;
++    }
++
++    std::map<int, MayAcceptPolicy*>::const_iterator map_accept = acceptHead_.begin();
++    while (map_accept != acceptHead_.end()) {
++        MayAcceptPolicy* deletePtr = (*map_accept).second;
++        MayAcceptPolicy* tempPtr = NULL;
++        while ( deletePtr != NULL){
++            tempPtr = deletePtr->next_;
++            delete deletePtr;
++            deletePtr = tempPtr;
++        }
++        ++map_accept;
++    }
++
++    std::map<int, OkNeighborPolicy*>::const_iterator map_okNeighbor = neighborHead_.begin();
++    while (map_okNeighbor != neighborHead_.end()) {
++        OkNeighborPolicy* deletePtr = (*map_okNeighbor).second;
++        OkNeighborPolicy* tempPtr = NULL;
++        while ( deletePtr != NULL){
++            tempPtr = deletePtr->next_;
++            delete deletePtr;
++            deletePtr = tempPtr;
++        }
++        ++map_okNeighbor;
++    }
++}
++
++void PolicyQueue::enqueue(Policy* p, int type)
++{
++    BeaconPolicy* mbp;
++    MaySharePolicy* msp;
++    MayAcceptPolicy* map;
++    OkNeighborPolicy* mnp;
++
++    switch (type) {
++    case PT_MayBeacon:
++        mbp = (BeaconPolicy*) p;
++        addBeaconPolicy(mbp);
++        break;
++    case PT_MayShare:
++        msp = (MaySharePolicy*) p;
++        addSharePolicy(msp);
++        break;
++    case PT_MayAccept:
++        map = (MayAcceptPolicy*) p;
++        addAcceptPolicy(map);
++        break;
++    case PT_MayNeighbor:
++        mnp = (OkNeighborPolicy*) p;
++        addNeighborPolicy(mnp);
++        break;
++    default:
++        break;
++    }
++}
++
++BeaconPolicy* PolicyQueue::addBeaconPolicy(BeaconPolicy* bp)
++{
++    if (bp == 0) return 0;
++
++    BeaconPolicy* temp = bcnTail_;
++    if (!bcnTail_) bcnHead_ = bcnTail_ = bp;
++    else {
++        bcnTail_->next_ = bp;
++        bcnTail_ = bp;
++    }
++    bcnTail_->next_ = 0;
++    bcnSize_++;
++    return temp;
++} 
++
++
++MaySharePolicy* PolicyQueue::addSharePolicy(MaySharePolicy* msp) 
++{
++    if (msp == 0) return 0;
++    int otherID = msp->getOtherID();
++    double addStartTime = msp->getStartTime();
++    double addEndTime = msp->getEndTime();
++    MaySharePolicy* startBlock = NULL;
++    MaySharePolicy* endBlock = NULL;
++    MaySharePolicy* temp = shareHead_[otherID];
++    MaySharePolicy* startBefore = temp;
++    int offset = 0;
++    
++    if (shareTail_[otherID] == NULL){// if none at all
++        shareTail_[otherID] = shareHead_[otherID] = msp;
++        shareTail_[otherID]->next_ = 0;
++        shareSize_[otherID]++;
++    }
++    else if(addStartTime >= shareTail_[otherID]->getEndTime()){//if add policy start time is greater than current end time
++        shareTail_[otherID]->next_ = msp;
++        shareTail_[otherID] = msp;
++        shareTail_[otherID]->next_ = 0;
++        shareSize_[otherID]++;
++    }
++    else {// if overlapped
++        while (temp) {
++            if (addStartTime < temp->getEndTime()){
++                startBlock = temp;
++                break;
++            }
++            startBefore = temp;
++            temp = temp->next_;
++        }
++        while (temp) {
++            if (addEndTime < temp->getEndTime()){
++                endBlock = temp;
++                break;
++            }
++            temp = temp->next_;
++            offset++;
++        }
++
++        int id = msp->getPolicyId();
++        double ri = msp->getRefreshInterval();
++        int prop = msp->getProposition();
++        int id2  = msp->getOtherID();
++
++        MaySharePolicy* beforePolicy = new MaySharePolicy(id, ri,
++                                                          startBlock->getStartTime(),
++                                                          addStartTime,
++                                                          id2, prop);
++        MaySharePolicy* afterPolicy = new MaySharePolicy(id, ri,
++                                                         addEndTime,
++                                                         endBlock->getEndTime(),
++                                                         id2, prop);
++        afterPolicy->next_ = endBlock->next_;
++        msp->next_ = afterPolicy;
++        beforePolicy->next_ = msp;
++
++        if (startBefore == startBlock){
++            shareHead_[otherID]= beforePolicy;
++        }else {
++            startBefore->next_ = beforePolicy;
++        }
++
++        shareSize_[otherID] = shareSize_[otherID]+ (2 - offset);
++
++        MaySharePolicy* deletePtr = NULL;
++        while ( startBlock != endBlock){
++            deletePtr = startBlock;
++            startBlock = startBlock->next_;
++            delete deletePtr;
++        }
++        delete endBlock;
++        if(startBefore == endBlock){
++            startBefore = NULL;
++        };
++        endBlock = NULL;
++        startBlock = NULL;
++    }
++
++    if (shareTail_[otherID] != NULL){
++        while(shareTail_[otherID] != NULL){
++            if (shareTail_[otherID]->next_ == NULL){break;}
++            shareTail_[otherID] = shareTail_[otherID]->next_;
++        }
++    }
++    return shareTail_[otherID];
++}
++
++MaySharePolicy* PolicyQueue::getMaySharePolicy(int otherID, double now)
++{
++    MaySharePolicy* temp = shareHead_[otherID];
++    while (temp) {
++        if (now < temp->getEndTime() ){
++            //return temp;
++            //this to delete old policy
++                        MaySharePolicy* deletePtr = NULL;
++                        while ( shareHead_[otherID] != temp){
++                            deletePtr = shareHead_[otherID];
++                            shareHead_[otherID] = shareHead_[otherID]->next_;
++                            delete deletePtr;
++                        }
++            return temp;
++        }
++        else{temp = temp->next_;}
++    }
++    return 0;
++}
++
++//Accpet
++MayAcceptPolicy* PolicyQueue::addAcceptPolicy(MayAcceptPolicy* map)
++{
++    if (map == 0) return 0;
++    int otherID = map->getOtherID();
++    double addStartTime = map->getStartTime();
++    double addEndTime = map->getEndTime();
++    MayAcceptPolicy* startBlock = NULL;
++    MayAcceptPolicy* endBlock = NULL;
++    MayAcceptPolicy* temp = acceptHead_[otherID];
++    MayAcceptPolicy* startBefore = temp;
++    int offset = 0;
++
++    if (acceptTail_[otherID] == NULL){// if none at all
++        acceptTail_[otherID] = acceptHead_[otherID] = map;
++        acceptTail_[otherID]->next_ = 0;
++        acceptSize_[otherID]++;
++    }
++    else if(addStartTime >= acceptTail_[otherID]->getEndTime()){//if add policy start time is greater than current end time
++        acceptTail_[otherID]->next_ = map;
++        acceptTail_[otherID] = map;
++        acceptTail_[otherID]->next_ = 0;
++        acceptSize_[otherID]++;
++    }
++    else {// if overlapped
++        while (temp) {
++            if (addStartTime < temp->getEndTime()){
++                startBlock = temp;
++                break;
++            }
++            startBefore = temp;
++            temp = temp->next_;
++        }
++        while (temp) {
++            if (addEndTime < temp->getEndTime()){
++                endBlock = temp;
++                break;
++            }
++            temp = temp->next_;
++            offset++;
++        }
++
++        int id = map->getPolicyId();
++        double ri = map->getRefreshInterval();
++        int prop = map->getProposition();
++        int id2  = map->getOtherID();
++
++        MayAcceptPolicy* beforePolicy = new MayAcceptPolicy(id, ri,
++                                                            startBlock->getStartTime(),
++                                                            addStartTime,
++                                                            id2, prop);
++        MayAcceptPolicy* afterPolicy = new MayAcceptPolicy(id, ri,
++                                                           addEndTime,
++                                                           endBlock->getEndTime(),
++                                                           id2, prop);
++        afterPolicy->next_ = endBlock->next_;
++        map->next_ = afterPolicy;
++        beforePolicy->next_ = map;
++
++        if (startBefore == startBlock){
++            acceptHead_[otherID]= beforePolicy;
++        }else {
++            startBefore->next_ = beforePolicy;
++        }
++        acceptSize_[otherID] = acceptSize_[otherID]+ (2 - offset);
++        MayAcceptPolicy* deletePtr = NULL;
++        while ( startBlock != endBlock){
++            deletePtr = startBlock;
++            startBlock = startBlock->next_;
++            delete deletePtr;
++        }
++        delete endBlock;
++        if(startBefore == endBlock){
++            startBefore = NULL;
++        };
++        endBlock = NULL;
++        startBlock = NULL;
++    }
++
++    if (acceptTail_[otherID] != NULL){
++        while(acceptTail_[otherID] != NULL){
++            if (acceptTail_[otherID]->next_ == NULL){break;}
++            acceptTail_[otherID] = acceptTail_[otherID]->next_;
++        }
++    }
++    return acceptTail_[otherID];
++}
++
++MayAcceptPolicy* PolicyQueue::getAcceptPolicy(int otherID, double now)
++{
++    MayAcceptPolicy* temp = acceptHead_[otherID];
++    while (temp) {
++        if (now < temp->getEndTime() ){
++            //return temp;
++            //this to delete old policy
++            //            MayAcceptPolicy* deletePtr = NULL;
++            //            while ( acceptHead_[otherID] != temp){
++            //                deletePtr = acceptHead_[otherID];
++            //                acceptHead_[otherID] = acceptHead_[otherID]->next_;
++            //                delete deletePtr;
++            //            }
++            return temp;
++        }
++        else{temp = temp->next_;}
++    }
++    return 0;
++}
++
++
++
++//Neigoubor
++OkNeighborPolicy* PolicyQueue::addNeighborPolicy(OkNeighborPolicy* onp)
++{
++    if (onp == 0) return 0;
++    int otherID = onp->getOtherID();
++    double addStartTime = onp->getStartTime();
++    double addEndTime = onp->getEndTime();
++    OkNeighborPolicy* startBlock = NULL;
++    OkNeighborPolicy* endBlock = NULL;
++    OkNeighborPolicy* temp = neighborHead_[otherID];
++    OkNeighborPolicy* startBefore = temp;
++    int offset = 0;
++
++    if (neighborTail_[otherID] == NULL){// if none at all
++        neighborTail_[otherID] = neighborHead_[otherID] = onp;
++        neighborTail_[otherID]->next_ = 0;
++        neighborSize_[otherID]++;
++    }
++    else if(addStartTime >= neighborTail_[otherID]->getEndTime()){//if add policy start time is greater than current end time
++        neighborTail_[otherID]->next_ = onp;
++        neighborTail_[otherID] = onp;
++        neighborTail_[otherID]->next_ = 0;
++        neighborSize_[otherID]++;
++    }
++    else {// if overlapped
++        while (temp) {
++            if (addStartTime < temp->getEndTime()){
++                startBlock = temp;
++                break;
++            }
++            startBefore = temp;
++            temp = temp->next_;
++        }
++        while (temp) {
++            if (addEndTime < temp->getEndTime()){
++                endBlock = temp;
++                break;
++            }
++            temp = temp->next_;
++            offset++;
++        }
++
++        int id = onp->getPolicyId();
++        double ri = onp->getRefreshInterval();
++        int prop = onp->getProposition();
++        int id2  = onp->getOtherID();
++        //        double crt = onp->getCreateTime();//ADD
++
++        OkNeighborPolicy* beforePolicy = new OkNeighborPolicy(id, ri,
++                                                              startBlock->getStartTime(),
++                                                              addStartTime,
++                                                              id2, prop);
++        OkNeighborPolicy* afterPolicy = new OkNeighborPolicy(id, ri,
++                                                             addEndTime,
++                                                             endBlock->getEndTime(),
++                                                             id2, prop);
++        afterPolicy->next_ = endBlock->next_;
++        onp->next_ = afterPolicy;
++        beforePolicy->next_ = onp;
++
++        if (startBefore == startBlock){
++            neighborHead_[otherID]= beforePolicy;
++        }else {
++            startBefore->next_ = beforePolicy;
++        }
++        neighborSize_[otherID] = neighborSize_[otherID]+ (2 - offset);
++        OkNeighborPolicy* deletePtr = NULL;
++        while ( startBlock != endBlock){
++            deletePtr = startBlock;
++            startBlock = startBlock->next_;
++            delete deletePtr;
++        }
++        delete endBlock;
++        if(startBefore == endBlock){
++            startBefore = NULL;
++        };
++        endBlock = NULL;
++        startBlock = NULL;
++    }
++
++    if (neighborTail_[otherID] != NULL){
++        while(neighborTail_[otherID] != NULL){
++            if (neighborTail_[otherID]->next_ == NULL){break;}
++            neighborTail_[otherID] = neighborTail_[otherID]->next_;
++        }
++    }
++    return neighborTail_[otherID];
++}
++
++OkNeighborPolicy* PolicyQueue::getNeighborPolicy(int otherID, double now)
++{
++    OkNeighborPolicy* temp = neighborHead_[otherID];
++    while (temp) {
++        if (now < temp->getEndTime() ){
++            //return temp;
++            //this to delete old policy
++            //            OkNeighborPolicy* deletePtr = NULL;
++            //            while ( neighborHead_[otherID] != temp){
++            //                deletePtr = neighborHead_[otherID];
++            //                neighborHead_[otherID] = neighborHead_[otherID]->next_;
++            //                delete deletePtr;
++            //            }
++            return temp;
++        }
++        else{temp = temp->next_;}
++    }
++    return 0;
++}
++
++
++
++
++//4 duplicates
++BeaconPolicy* PolicyQueue::duplicateBcn(BeaconPolicy* bcn_policy)
++{
++    int id = bcn_policy->getPolicyId();
++    double ri = bcn_policy->getRefreshInterval();
++    double st = bcn_policy->getStartTime();
++    double et = bcn_policy->getEndTime();
++    int prop = bcn_policy->getProposition();
++    int bi  = bcn_policy->getBeaconInterval();
++
++    BeaconPolicy *retBcnPolicy = new BeaconPolicy(id, ri, st, et,prop, bi);
++
++    return retBcnPolicy;
++}
++
++MaySharePolicy* PolicyQueue::duplicateMayShare(MaySharePolicy* maySharePolicy)
++{
++    int id = maySharePolicy->getPolicyId();
++    double ri = maySharePolicy->getRefreshInterval();
++    double st = maySharePolicy->getStartTime();
++    double et = maySharePolicy->getEndTime();
++    int prop = maySharePolicy->getProposition();
++    int id2  = maySharePolicy->getOtherID();
++
++    MaySharePolicy *Maysp = new MaySharePolicy(id, ri, st, et, id2, prop);
++
++    return Maysp;
++}
++
++MayAcceptPolicy* PolicyQueue::duplicateMayAccept(MayAcceptPolicy* mayAcceptPolicy)
++{
++    int id = mayAcceptPolicy->getPolicyId();
++    double ri = mayAcceptPolicy->getRefreshInterval();
++    double st = mayAcceptPolicy->getStartTime();
++    double et = mayAcceptPolicy->getEndTime();
++    int prop = mayAcceptPolicy->getProposition();
++    int id2  = mayAcceptPolicy->getOtherID();
++
++    MayAcceptPolicy* retPolicy = new MayAcceptPolicy(id, ri, st, et, id2, prop);
++
++    return retPolicy;
++}
++
++OkNeighborPolicy* PolicyQueue::duplicateOkNeighbor(OkNeighborPolicy* oKNeighbourPolicy)
++{
++    int id = oKNeighbourPolicy->getPolicyId();
++    double ri = oKNeighbourPolicy->getRefreshInterval();
++    double st = oKNeighbourPolicy->getStartTime();
++    double et = oKNeighbourPolicy->getEndTime();
++    int prop = oKNeighbourPolicy->getProposition();
++    int id2  = oKNeighbourPolicy->getOtherID();
++
++    OkNeighborPolicy *okNP = new OkNeighborPolicy(id, ri, st, et, id2, prop);
++    /*
++	printf("Copying.\n");
++	onp->debug();
++	printf("done.\n");
++	okNP->debug();
++	*/	
++    return okNP;
++}
++
++//for debug issue
++void PolicyQueue::accept_pushback(PolicyQueue* pq)
++{
++    if (pq == NULL) return;
++
++    BeaconPolicy* bcnTemp = pq->getBeaconPolicy();
++    BeaconPolicy* bcnNext = bcnTemp;
++    while (bcnTemp) {
++        BeaconPolicy* newPolicy = duplicateBcn(bcnTemp);
++        bcnNext = bcnTemp->next_;
++        addBeaconPolicy(newPolicy);
++        bcnTemp = bcnNext;
++    }
++
++    //
++    std::map<int, MaySharePolicy*>::const_iterator map_share = shareHead_.begin();
++    while (map_share != shareHead_.end()) {
++        MaySharePolicy* shareTemp = pq->getShareHead( (*map_share).first );
++        MaySharePolicy* shareNext = shareTemp;
++        while (shareTemp) {
++            MaySharePolicy* newPolicy = duplicateMayShare(shareTemp);
++            shareNext = shareTemp->next_;
++            addSharePolicy(newPolicy);
++            shareTemp = shareNext;
++        }
++        ++map_share;
++    }
++
++    std::map<int, MayAcceptPolicy*>::const_iterator map_accept = acceptHead_.begin();
++    while (map_accept != acceptHead_.end()) {
++        MayAcceptPolicy* acceptTemp = pq->getAcceptHead( (*map_accept).first );
++        MayAcceptPolicy* acceptNext = acceptTemp;
++        while (acceptTemp) {
++            MayAcceptPolicy* newPolicy = duplicateMayAccept(acceptTemp);
++            acceptNext = acceptTemp->next_;
++            addAcceptPolicy(newPolicy);
++            acceptTemp = acceptNext;
++        }
++        ++map_accept;
++    }
++
++    std::map<int, OkNeighborPolicy*>::const_iterator map_neighbor = neighborHead_.begin();
++    while (map_neighbor != neighborHead_.end()) {
++        OkNeighborPolicy* neighborTemp = pq->getNeighborHead( (*map_neighbor).first );
++        OkNeighborPolicy* neighborNext = neighborTemp;
++        while (neighborTemp) {
++            OkNeighborPolicy* newPolicy = duplicateOkNeighbor(neighborTemp);
++            neighborNext = neighborTemp->next_;
++            addNeighborPolicy(newPolicy);
++            neighborTemp = neighborNext;
++        }
++        ++map_neighbor;
++    }
++}
++
++//
++//void PolicyQueue::accept_pushback(PolicyQueue* pq)
++//{
++//    if (pq == NULL) return;
++//
++//    BeaconPolicy* bcnTemp = pq->getBeaconPolicy();
++//    BeaconPolicy* bcnNext = bcnTemp;
++//    while (bcnTemp) {
++//        BeaconPolicy* newPolicy = duplicateBcn(bcnTemp);
++//        bcnNext = bcnTemp->next_;
++//        addBeaconPolicy(newPolicy);
++//        bcnTemp = bcnNext;
++//    }
++//
++//    for (int i=0; i< nn_; i++){
++//
++//        MaySharePolicy* shareTemp = pq->getShareHead(i);
++//        MaySharePolicy* shareNext = shareTemp;
++//        while (shareTemp) {
++//            MaySharePolicy* newPolicy = duplicateMayShare(shareTemp);
++//            shareNext = shareTemp->next_;
++//            addSharePolicy(newPolicy);
++//            shareTemp = shareNext;
++//        }
++//
++//        MayAcceptPolicy* acceptTemp = pq->getAcceptHead(i);
++//        MayAcceptPolicy* acceptNext = acceptTemp;
++//        while(acceptTemp) {
++//            MayAcceptPolicy* newPolicy = duplicateMayAccept(acceptTemp);
++//            acceptNext = acceptTemp->next_;
++//            addAcceptPolicy(newPolicy);
++//            acceptTemp = acceptNext;
++//        }
++//
++//        OkNeighborPolicy* neighborTemp = pq->getNeighborHead(i);
++//        OkNeighborPolicy* neighborNext = neighborTemp;
++//        while(neighborTemp) {
++//            OkNeighborPolicy* newPolicy =duplicateOkNeighbor(neighborTemp);
++//            neighborNext = neighborTemp->next_;
++//            addNeighborPolicy(newPolicy);
++//            neighborTemp = neighborNext;
++//        }
++//    }
++//}
++//
++
++/*
++void PolicyQueue::debug()
++{
++    BeaconPolicy* beaconTemp = bcnHead_;
++    while (beaconTemp) {
++        beaconTemp->debug();
++        beaconTemp = beaconTemp->next_;
++    }
++    MaySharePolicy* shareTemp = shareHead_;
++    while (shareTemp) {
++        shareTemp->debug();
++        shareTemp = shareTemp->next_;
++    }
++
++    MayAcceptPolicy* acceptTemp = acceptHead_;
++    while (acceptTemp) {
++        acceptTemp->debug();
++        acceptTemp = acceptTemp->next_;
++    }
++
++    OkNeighborPolicy* neighborTemp = neighborHead_;
++    while (neighborTemp) {
++        neighborTemp->debug();
++        neighborTemp = neighborTemp->next_;
++    }
++}
++*/
++
++
++
++
++
++
++
++
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policyqueue.h	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/policyqueue.h	2011-11-04 02:24:17.789037000 -0400
+@@ -0,0 +1,55 @@
++#ifndef policyqueue_h
++#define policyqueue_h 
++
++#include "policies.h"
++#include <map>
++
++class PolicyQueue {
++
++public:
++    PolicyQueue();
++    ~PolicyQueue();
++    void enqueue(Policy* p, int type);
++    /* Returns the last beacon policy before enque */
++    BeaconPolicy* addBeaconPolicy(BeaconPolicy* bp);
++    MaySharePolicy* addSharePolicy(MaySharePolicy* msp);
++    MayAcceptPolicy* addAcceptPolicy(MayAcceptPolicy* map);
++    OkNeighborPolicy* addNeighborPolicy(OkNeighborPolicy* onp);
++
++    BeaconPolicy* duplicateBcn(BeaconPolicy* bcn_policy);
++    MaySharePolicy* duplicateMayShare(MaySharePolicy* maySharePolicy);
++    MayAcceptPolicy* duplicateMayAccept(MayAcceptPolicy* mayAcceptPolicy);
++    OkNeighborPolicy* duplicateOkNeighbor(OkNeighborPolicy* oKNeighbourPolicy);
++
++    int sizeOfBeaconQueue() { return bcnSize_;}
++    int sizeOfShareQueue(int otherID) { return shareSize_[otherID];}
++    int sizeOfAcceptnQueue(int otherID) { return acceptSize_[otherID];}
++    int sizeOfNeighbourQueue(int otherID) { return neighborSize_[otherID];}
++    //void debug();
++    void accept_pushback(PolicyQueue* pq);// accept all policy in a queue from other node, and add them into myself queue
++
++    MaySharePolicy* getShareHead(int otherID) { return shareHead_[otherID];}
++    MayAcceptPolicy* getAcceptHead(int otherID) { return acceptHead_[otherID];}
++    OkNeighborPolicy* getNeighborHead(int otherID) { return neighborHead_[otherID];}
++
++    BeaconPolicy* getBeaconPolicy() {return bcnHead_;}
++
++    OkNeighborPolicy* getNeighborPolicy(int id, double now);//in order to find these 3 policy, need to traveral all the queue
++    MaySharePolicy* getMaySharePolicy(int id, double now);// while bcn policy is just the bcnHead;
++    MayAcceptPolicy* getAcceptPolicy(int id, double now);
++
++private:
++    BeaconPolicy *bcnHead_, *bcnTail_;
++    int bcnSize_;
++    std::map<int, MaySharePolicy*> shareHead_;
++    std::map<int, MaySharePolicy*> shareTail_;
++    std::map<int, int> shareSize_;
++    std::map<int, MayAcceptPolicy*> acceptHead_;
++    std::map<int, MayAcceptPolicy*> acceptTail_;
++    std::map<int, int> acceptSize_;
++    std::map<int, OkNeighborPolicy*> neighborHead_;
++    std::map<int, OkNeighborPolicy*> neighborTail_;
++    std::map<int, int> neighborSize_;
++};
++
++#endif
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/state.cc	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/state.cc	2011-08-25 13:51:58.365659000 -0400
+@@ -0,0 +1,38 @@
++#include "state.h"
++#include "pbc.h"
++
++
++State::State(PBCAgent* p, int otherID, double halfTimeout, double fullTimeout, double upkeepInterval)
++    :agent_(p),
++    otherID_(otherID),
++    state_(UNDEFINED),
++    halfTimeout_(halfTimeout),
++    fullTimeout_(fullTimeout),
++    upkeepTimeout_(upkeepInterval)
++{
++
++        halfTimer_ = new HalfOpenTimer(this, halfTimeout_);
++        fullTimer_ = new FullOpenTimer(this, fullTimeout_);
++        upkeepTimer_ = new UpkeepTimer(this, upkeepTimeout_);
++}
++
++void State::updateLastRecv(){
++    double now = Scheduler::instance().clock();
++    lastUpKeepRecv_ = now;
++    printf("%f: node %d--%d update LastRecv\n", now, agent_->getMyID(),otherID_);
++}
++
++
++void State::event_m_NbrTimeout(){
++    //when connection time out, reset firstRecvBcn
++//    agent_->resetFirstSeenBcn(otherID_);
++    double now = Scheduler::instance().clock();
++    printf("%f: node %d--%d NbrTimeout\n", now, agent_->getMyID(),otherID_);
++
++    if (agent_->myPolicies_->getBeaconPolicy()->getProposition() == TRUE){
++        agent_->enterActive(otherID_);
++    }else{
++        agent_->enterPassive(otherID_);
++    }
++}
++
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/state.h	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/state.h	2011-11-04 02:23:57.390034000 -0400
+@@ -0,0 +1,82 @@
++#ifndef STATE_H
++#define STATE_H
++
++/////////////////////////////////////////////////////////////////////////////////////////////
++/* State
++ * 		A class to maintain connections between two nodes, once they've bootstrapped.
++ * 		Check for active connections when in Full Open state with the other node by sending 
++ * 		a simple ping-like packet to the other node. 	
++ */
++/////////////////////////////////////////////////////////////////////////////////////////////
++
++#include "pbc.h"
++#include "timers.h"
++
++
++class PBCAgent;
++class HalfOpenTimer;
++class FullOpenTimer;
++class UpkeepTimer;
++
++
++class State  {
++    friend class PBCAgent;
++    friend class HalfOpenTimer;//In order to modified
++    friend class FullOpenTimer;
++    friend class UpkeepTimer;
++public:
++    State(PBCAgent* a, int otherID, double halfTimeout, double fullTimeout_ ,double upkeepTimeout);
++    int getState() {
++        return state_;
++    }
++    int getOtherID() {
++        return otherID_;
++    }
++    void setState(int state) {
++        state_ = state;
++    }
++    void setOtherID(int val) {
++        otherID_ = val;
++    }
++    void updateLastRecv();
++    void event_m_NbrTimeout();
++
++    //	double inline gethoDuration() {
++    //		return hoDuration_;
++    //	}
++
++    //	bool isConnected();
++    //	void createConnection(double start, int id);
++    //	bool startConnection(double end);
++    //	void sendData();
++    //        void recvData();
++    //	void reset();
++    //	void debug();
++    //	void fail();
++    //	void success();
++
++    PBCAgent* getAgent(){return agent_;};
++private:
++    PBCAgent* agent_;
++    int otherID_;						/* The id of the other node */
++    int state_;						/* The current state respective to the other node */
++
++    double halfTimeout_; 			/* The half Timeout value */
++    double fullTimeout_; 			/* The half Timeout value */
++    double upkeepTimeout_;			/* The upkeep timeout value */
++
++    //	double startTime_;				/* The start time of the connection */
++    //	double foDuration_;				/* The full open duration */
++    //	double hoDuration_;				/* The half open duration */
++
++    double lastUpKeepRecv_;			/* The last time received a ping packet from the connected node */
++    //	bool isConnected_;				/* Is currently connected to the other node */
++
++    HalfOpenTimer*  halfTimer_;
++    FullOpenTimer*  fullTimer_;
++    UpkeepTimer*    upkeepTimer_;
++    //
++
++};
++
++#endif
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/timers.cc	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/timers.cc	2011-11-04 02:25:48.801488000 -0400
+@@ -0,0 +1,76 @@
++#include "timers.h"
++#include "random.h"
++
++
++
++void BootstrapTimer::start()
++{// if !isStarted, start with period time.
++    if(!isStarted_) {
++        Scheduler &s = Scheduler::instance();
++        double offset = period_ + Random::uniform(0.0, 0.001);
++        s.schedule(this, &intr_, offset);
++        isStarted_ = 1;
++    }
++}
++void BootstrapTimer::stop()
++{// is started, stop
++    Scheduler &s = Scheduler::instance();
++    if (isStarted_) {
++        s.cancel(&intr_);
++    }
++    isStarted_ = 0;
++}
++
++HalfOpenTimer::HalfOpenTimer(State* s, double p)
++{//ctor for half timer
++    state_     = s;
++    isStarted_ = 0;
++    period_    = p;
++}
++
++void HalfOpenTimer::handle(Event *e)
++{//event 7, nbr timeout
++    double now = Scheduler::instance().clock();
++    int otherID = state_->getOtherID();
++    printf("%f: node %d--%d half Timeout\n", now, state_->agent_->getMyID(),otherID);
++    if( state_->getState() != FULL) {
++        state_->event_m_NbrTimeout();////back to A or P according to MayBeacon policy
++    };
++}
++
++FullOpenTimer::FullOpenTimer(State* s, double p)
++{
++    state_     = s;
++    isStarted_ = 0;
++    period_    = p;
++}
++void FullOpenTimer::handle(Event *e)
++{//event 7, nbr timeout
++    double now = Scheduler::instance().clock();
++    if ( (now -state_->lastUpKeepRecv_) > period_ ){
++        state_->event_m_NbrTimeout();
++        printf("%f: node %d--%d full Timeout\n", now, state_->agent_->getMyID(),state_->getOtherID());
++        state_->getAgent()->connects_ --;
++    }
++}
++
++UpkeepTimer::UpkeepTimer(State* s, double p)
++{
++    state_   = s;
++    isStarted_ = 0;
++    period_  = p;
++}
++void UpkeepTimer::handle(Event *e)
++{//event 6, to ping
++    //sendping to current pkt otherID;
++    double now = Scheduler::instance().clock();
++    int otherID = state_->getOtherID();
++    printf("%f: node %d--%d upkeep timeup, ping\n", now, state_->agent_->getMyID(),otherID);
++    PBCAgent* myAgent = state_->agent_;
++    Packet* pingPkt = myAgent->createPingPacket(otherID);
++    myAgent->sendPacket(pingPkt);
++    double offset = period_ + Random::uniform(0.0,0.01);
++    Scheduler &s = Scheduler::instance();
++    s.schedule(this, &intr_, offset);
++
++} 
+
+--- a-ns-allinone-2.34/ns-2.34/mobile/bootstrap/timers.h	1969-12-31 19:00:00.000000000 -0500
++++ b-ns-allinone-2.34/ns-2.34/mobile/bootstrap/timers.h	2011-11-04 02:25:33.261055000 -0400
+@@ -0,0 +1,54 @@
++#ifndef TIMERS_H
++#define TIMERS_H
++
++
++#include "scheduler.h"
++#include "state.h"
++
++class State;
++
++class BootstrapTimer : public Handler {
++public:
++
++    BootstrapTimer() {
++        state_ = 0;
++        isStarted_ = false;
++        period_ = 0;
++    }
++    BootstrapTimer(State* s, double p) {
++        state_   = s;
++        isStarted_ = false;
++        period_  = p;
++    }
++    void start(void);
++    void stop(void);
++
++
++protected:	
++    int	isStarted_;
++    Event 	intr_;
++    State*	state_;
++    double  period_;
++
++};
++
++class HalfOpenTimer : public BootstrapTimer {
++public:
++    HalfOpenTimer(State* s, double p);
++    void setTimer(double p){ period_ = p;}
++    void handle(Event* e);
++};
++
++class FullOpenTimer : public BootstrapTimer {
++public:
++    FullOpenTimer(State* s, double p);
++    void handle(Event* e);
++};
++
++class UpkeepTimer : public BootstrapTimer {
++public:
++    UpkeepTimer(State* s, double p);
++    void handle(Event* e);
++};
++
++#endif
+
+--- a-ns-allinone-2.34/ns-2.34/tcl/lib/ns-default.tcl	2009-06-14 13:35:41.000000000 -0400
++++ b-ns-allinone-2.34/ns-2.34/tcl/lib/ns-default.tcl	2011-10-31 11:18:28.697062000 -0400
+@@ -1463,3 +1463,15 @@ Agent/PBC set periodicBroadcastInterval 
+ Agent/PBC set periodicBroadcastVariance 0.1
+ Agent/PBC set modulationScheme 0
+ 
++Agent/PBC set ni 0
++Agent/PBC set avgLoss 0.0
++Agent/PBC set avgDelay 0.0
++Agent/PBC set dynaTimerSet 0
++
++Agent/PBC set halfTimeout 1.0
++Agent/PBC set fullTimeout 2.0
++Agent/PBC set upkeepTimeout 0.5
++Agent/PBC set alpha 0.01
++
++
++
+
+--- a-ns-allinone-2.34/otcl-1.13/configure	2009-06-14 13:35:49.000000000 -0400
++++ b-ns-allinone-2.34/otcl-1.13/configure	2011-01-26 19:45:53.392235000 -0500
+@@ -6301,7 +6301,7 @@ case $system in
+         ;;
+     Linux*)
+         SHLIB_CFLAGS="-fpic"
+-        SHLIB_LD="ld -shared"
++        SHLIB_LD="gcc -shared"
+         SHLIB_SUFFIX=".so"
+         DL_LIBS="-ldl"
+         SHLD_FLAGS=""
